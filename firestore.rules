@@ -1,0 +1,199 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() { return request.auth != null; }
+    function isVerified() { return isSignedIn() && (request.auth.token.email_verified == true || request.auth.token.firebase.sign_in_provider == 'google.com'); }
+    function isAdmin() { return isSignedIn() && request.auth.token.email == 'infodailyyield@gmail.com'; }
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+
+    // --- User Profiles ---
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.keys().hasAll(['uid', 'email', 'displayName', 'balanceNGN', 'walletBalance', 'totalProfitNGN', 'totalDepositedNGN', 'totalWithdrawnNGN', 'activeInvestments', 'streak', 'totalGamesPlayed', 'createdAt', 'kycStatus', 'tier', 'referralCode', 'totalReferrals', 'referralEarnings', 'hasRedeemedCode', 'pushEnabled', 'referredBy', 'referrerUid'])
+               && data.uid == request.auth.uid
+               && (data.balanceNGN is number || data.balanceNGN is int)
+               && data.kycStatus in ['unverified', 'pending', 'verified', 'rejected']
+               && data.tier in ['tier1', 'tier2', 'tier3', 'premium']
+               && (data.createdAt is timestamp || data.createdAt == request.time);
+      }
+      
+      // Helper for client-side referral bonus
+      function isReferralBonusUpdate(targetId) {
+        // ID pattern: redeemerUid_referrerUid
+        let refPath = /databases/$(database)/documents/referrals/$(request.auth.uid + "_" + targetId);
+        return existsAfter(refPath) 
+               && getAfter(refPath).data.referrerUid == targetId 
+               && getAfter(refPath).data.redeemerUid == request.auth.uid
+               && incoming().balanceNGN == existing().balanceNGN + 1000
+               && incoming().totalReferrals == existing().totalReferrals + 1
+               && incoming().referralEarnings == existing().referralEarnings + 1000
+               && incoming().diff(existing()).affectedKeys().hasOnly(['balanceNGN', 'totalReferrals', 'referralEarnings', 'updatedAt']);
+      }
+
+      function isBonusForReferrer(targetUid) {
+        let refPath = /databases/$(database)/documents/referrals/$(request.auth.uid + "_" + targetUid);
+        return existsAfter(refPath) && getAfter(refPath).data.referrerUid == targetUid;
+      }
+
+      allow get: if isOwner(userId) || isAdmin();
+      // Allow searching for users by referralCode
+      allow list: if isAdmin() || (isSignedIn() && request.query.limit <= 1);
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      allow update: if (isOwner(userId) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'phone', 'address', 'email', 'kycDocs', 'kycStatus', 'lastCheckIn', 'streak', 'hasRedeemedCode', 'referralCode', 'balanceNGN', 'walletBalance', 'totalProfitNGN', 'totalDepositedNGN', 'totalWithdrawnNGN', 'pushEnabled', 'referredBy', 'referrerUid', 'activeInvestments', 'totalGamesPlayed', 'totalGamesWon', 'totalReferrals', 'referralEarnings', 'updatedAt'])
+      )) || isReferralBonusUpdate(userId) || isAdmin();
+    }
+
+    // --- Deposit Requests ---
+    match /depositRequests/{requestId} {
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid 
+                    && request.resource.data.status == 'pending'
+                    && request.resource.data.amount >= 3000;
+      allow update, delete: if isAdmin();
+    }
+
+    // --- KYC Requests ---
+    match /kycRequests/{id} {
+      allow list, get: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+      allow create: if isSignedIn() && incoming().uid == request.auth.uid;
+      allow update: if isAdmin();
+    }
+
+    // --- Tier Requests ---
+    match /tierRequests/{id} {
+      allow list, get: if isAdmin() || (isSignedIn() && (resource.data.uid == request.auth.uid || resource.data.userId == request.auth.uid));
+      allow create: if isSignedIn() && (incoming().uid == request.auth.uid || incoming().userId == request.auth.uid);
+      allow update: if isAdmin();
+    }
+
+    // --- Referral Requests Rule ---
+    match /referralRequests/{id} {
+      function isValidRequest(data) {
+        return data.keys().hasAll(['referrerCode', 'referredUserId', 'referredUsername', 'status', 'createdAt'])
+               && data.referredUserId == request.auth.uid
+               && data.status == 'pending';
+      }
+      allow list: if isAdmin() || (isSignedIn() && resource.data.referredUserId == request.auth.uid);
+      allow get: if isAdmin() || (isSignedIn() && resource.data.referredUserId == request.auth.uid);
+      allow create: if isVerified() && isValidRequest(incoming());
+      allow update, delete: if isAdmin();
+    }
+
+    // --- Referral Rules ---
+    match /referrals/{id} {
+      function isValidReferral(data) {
+         let userData = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+         return data.keys().hasAll(['referrerUid', 'referrerEmail', 'redeemerUid', 'redeemerUsername', 'redeemerEmail', 'redeemerJoined', 'code', 'timestamp'])
+                && data.redeemerUid == request.auth.uid
+                && id == request.auth.uid + "_" + data.referrerUid
+                && (!('hasRedeemedCode' in userData) || userData.hasRedeemedCode == false);
+      }
+      allow list: if isAdmin() || (isSignedIn() && resource.data.referrerUid == request.auth.uid);
+      allow create: if isAdmin() || (isVerified() && isValidReferral(incoming()));
+      allow read, update, delete: if isAdmin();
+    }
+
+    // --- Market Duel Bids ---
+    match /marketDuelBids/{id} {
+      function isValidBid(data) {
+        return data.keys().hasAll(['userId', 'roundId', 'selection', 'amount', 'status', 'createdAt'])
+               && data.userId == request.auth.uid
+               && data.amount is number && data.amount >= 500
+               && data.selection in ['A', 'B']
+               && data.status in ['active', 'won', 'lost']
+               && (data.createdAt == request.time || data.createdAt is timestamp);
+      }
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isVerified() && isValidBid(incoming());
+      allow update: if isVerified() && existing().userId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'payout']);
+      allow read, write: if isAdmin();
+    }
+
+    // --- Withdrawals ---
+    match /withdrawals/{withdrawalId} {
+      function isValidWithdrawal(data) {
+        return data.keys().hasAll(['userId', 'userEmail', 'tier', 'amount', 'status', 'details', 'createdAt'])
+               && data.userId == request.auth.uid
+               && data.amount is number && data.amount > 0
+               && data.status == 'pending'
+               && (data.createdAt == request.time || data.createdAt is timestamp);
+      }
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow get: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidWithdrawal(incoming());
+      allow read, write: if isAdmin();
+    }
+
+    // --- Investments ---
+    match /investments/{id} {
+      function isValidInvestment(data) {
+        return data.keys().hasAll(['userId', 'planId', 'capital', 'rate', 'durationDays', 'startTime', 'endTime', 'status'])
+               && data.userId == request.auth.uid
+               && data.capital is number && data.capital > 0
+               && data.status == 'active'
+               && (data.startTime == request.time || data.startTime is timestamp);
+      }
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow get: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidInvestment(incoming());
+      allow update: if isSignedIn() && existing().userId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'currentProfit']);
+      allow read, write: if isAdmin();
+    }
+
+    // --- Transactions ---
+    match /transactions/{id} {
+      function isValidTransaction(data) {
+        return data.userId == request.auth.uid;
+      }
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow get: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && (isValidTransaction(incoming()) || isBonusForReferrer(incoming().userId));
+      allow read, write: if isAdmin();
+    }
+
+    // --- Notifications ---
+    match /notifications/{id} {
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow get: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && (incoming().userId == request.auth.uid || isBonusForReferrer(incoming().userId));
+      allow read, write: if isAdmin();
+    }
+
+    // --- Push Subscriptions ---
+    match /pushSubscriptions/{userId} {
+      allow get: if isOwner(userId) || isAdmin();
+      allow create, update: if isOwner(userId);
+      allow delete: if isOwner(userId) || isAdmin();
+    }
+
+    // --- Public Content ---
+    match /faqs/{id} { allow read: if true; allow write: if isAdmin(); }
+    match /airdrops/{id} { 
+      allow read: if true; 
+      allow update: if isSignedIn() && incoming().diff(existing()).affectedKeys().hasOnly(['totalClaims']);
+      allow write: if isAdmin(); 
+    }
+    match /broadcast/{id} { allow read: if true; allow write: if isAdmin(); }
+    match /system/{id} { allow read: if true; allow write: if isAdmin(); }
+    match /marketDuel/{id} { allow read: if true; allow write: if isAdmin(); }
+    match /marketDuelOutcomes/{id} { allow read: if true; allow write: if isAdmin(); }
+
+    // --- Sub-collections ---
+    match /users/{userId}/airdropsClaimed/{airdropId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId);
+    }
+  }
+}
